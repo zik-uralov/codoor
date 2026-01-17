@@ -6,6 +6,10 @@ Codoor-VoIP v1.0 - AI-Powered FreePBX/Asterisk Administration Assistant
 import argparse
 import json
 import os
+import sys
+import threading
+import time
+import re
 import shlex
 import subprocess
 from datetime import datetime
@@ -20,14 +24,19 @@ class CodoorVoIP:
         """
         Initialize Codoor-VoIP assistant.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
-        if not self.api_key:
-            raise ValueError("DeepSeek API key not provided. Set DEEPSEEK_API_KEY.")
+        self.settings = self._load_settings()
+        base_url = self._get_setting("base_url", "https://api.deepseek.com")
+        self.api_url = self._normalize_api_url(base_url)
+        self.model = self._get_setting("model", "deepseek-chat")
+        self.api_key = api_key or self._get_setting("api_key", "") or os.getenv("DEEPSEEK_API_KEY", "")
+        self._ensure_llm_settings()
 
-        self.api_url = "https://api.deepseek.com/v1/chat/completions"
-        self.model = "deepseek-chat"
+        if not self.api_key and "localhost" not in self.api_url:
+            raise ValueError("API key not provided. Set it in setup or DEEPSEEK_API_KEY.")
         self.verbose = verbose
         self.session_history: List[Dict[str, str]] = []
+        self.last_command_outputs: List[str] = []
+        self.last_commands_run: List[str] = []
 
         # FreePBX/Asterisk paths.
         self.paths = {
@@ -73,8 +82,111 @@ class CodoorVoIP:
         ]
 
         print("Codoor-VoIP v1.0 Initialized")
-        print(f"API: DeepSeek | Model: {self.model}")
+        print(f"API: {self.api_url} | Model: {self.model}")
         print(f"FreePBX Path: {self.paths['config']}")
+
+    def _start_timer(self, message: str = "Thinking") -> Dict[str, object]:
+        # Elapsed timer to show progress during LLM calls.
+        stop_event = threading.Event()
+        started = time.monotonic()
+
+        def tick() -> None:
+            while not stop_event.is_set():
+                elapsed = time.monotonic() - started
+                print(f"\r{message}... {elapsed:0.1f}s", end="", flush=True)
+                time.sleep(0.1)
+            print("\r" + " " * (len(message) + 12) + "\r", end="", flush=True)
+
+        thread = threading.Thread(target=tick, daemon=True)
+        thread.start()
+        return {"stop": stop_event, "thread": thread}
+
+    def _settings_path(self) -> Path:
+        return Path(".codoor_settings.json")
+
+    def _load_settings(self) -> Dict[str, object]:
+        settings_path = self._settings_path()
+        if not settings_path.exists():
+            return {}
+        try:
+            return json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_settings(self, settings: Dict[str, object]) -> None:
+        settings_path = self._settings_path()
+        settings_path.write_text(
+            json.dumps(settings, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _get_setting(self, key: str, default: str) -> str:
+        llm = self.settings.get("llm", {}) if isinstance(self.settings, dict) else {}
+        value = llm.get(key)
+        return value if isinstance(value, str) and value else default
+
+    def _normalize_api_url(self, base_url: str) -> str:
+        # Ensure we hit the OpenAI-compatible chat completions endpoint.
+        stripped = base_url.rstrip("/")
+        if stripped.endswith("/v1/chat/completions"):
+            return stripped
+        if stripped.endswith("/v1"):
+            return f"{stripped}/chat/completions"
+        return f"{stripped}/v1/chat/completions"
+
+    def _ensure_llm_settings(self) -> None:
+        if self.api_key:
+            return
+        if not sys.stdin.isatty():
+            return
+
+        providers = [
+            ("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
+            ("DeepSeek", "https://api.deepseek.com", "deepseek-chat"),
+            ("Anthropic", "https://api.anthropic.com/v1", "claude-3-5-sonnet-20240620"),
+            ("OpenRouter", "https://openrouter.ai/api/v1", "openai/gpt-4o-mini"),
+            ("Local", "http://localhost:8000/v1", "local-model"),
+        ]
+
+        print("\n" + "=" * 50)
+        print("First-time LLM setup")
+        print("Choose a provider:")
+        for idx, (name, _, _) in enumerate(providers, start=1):
+            print(f"{idx}) {name}")
+
+        choice = input("Select provider [1]: ").strip()
+        try:
+            choice_idx = int(choice) if choice else 1
+        except ValueError:
+            choice_idx = 1
+        if choice_idx < 1 or choice_idx > len(providers):
+            choice_idx = 1
+
+        name, base_url, model = providers[choice_idx - 1]
+        custom_base = input(f"Base URL [{base_url}]: ").strip()
+        if custom_base:
+            base_url = custom_base
+
+        custom_model = input(f"Model [{model}]: ").strip()
+        if custom_model:
+            model = custom_model
+
+        api_key = input("API key (leave empty for local endpoints): ").strip()
+
+        settings = self._load_settings()
+        llm = settings.get("llm", {}) if isinstance(settings, dict) else {}
+        llm["provider"] = name.lower()
+        llm["base_url"] = base_url
+        llm["model"] = model
+        if api_key:
+            llm["api_key"] = api_key
+        settings["llm"] = llm
+        self._save_settings(settings)
+
+        self.settings = settings
+        self.api_url = self._normalize_api_url(base_url)
+        self.model = model
+        self.api_key = api_key
 
     def _log_debug(self, message: str) -> None:
         if self.verbose:
@@ -85,24 +197,79 @@ class CodoorVoIP:
         config_root = Path(self.paths["config"]).resolve()
         return path == config_root or config_root in path.parents
 
+    def _is_safe_shell_command(self, command: str) -> bool:
+        # Block obviously destructive patterns.
+        dangerous = [
+            r"\brm\s+-rf\b",
+            r"\brm\s+--no-preserve-root\b",
+            r"\bmkfs\b",
+            r"\bfdisk\b",
+            r"\bdd\s+if=",
+            r">\s*/dev/sd",
+            r"\bshutdown\b",
+            r"\breboot\b",
+            r"\bpoweroff\b",
+        ]
+        for pattern in dangerous:
+            if re.search(pattern, command, re.IGNORECASE):
+                return False
+
+        # Split by shell operators and validate each segment.
+        segments = re.split(r"\s*(\|\||&&|\||;)\s*", command)
+        parts = [seg.strip() for seg in segments if seg.strip() and seg not in {"||", "&&", "|", ";"}]
+        for part in parts:
+            try:
+                tokens = shlex.split(part)
+            except ValueError:
+                return False
+            if not tokens:
+                return False
+            # Strip redirection tokens from validation.
+            cleaned = []
+            skip_next = False
+            for token in tokens:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if token in {">", ">>", "<", "2>", "2>>", "1>", "1>>"}:
+                    skip_next = True
+                    continue
+                cleaned.append(token)
+            if not cleaned:
+                return False
+            if cleaned[0] not in self.safe_commands:
+                return False
+        return True
+
     # ==================== SYSTEM INFORMATION ====================
 
     def run_command(self, command: str, timeout: int = 10) -> str:
         """Run a whitelisted command and return output."""
-        parts = shlex.split(command)
-        if not parts:
+        if not command.strip():
             raise ValueError("Empty command.")
-        if parts[0] not in self.safe_commands:
-            raise ValueError(f"Command not allowed: {parts[0]}")
+        if not self._is_safe_shell_command(command):
+            raise ValueError("Command not allowed.")
 
         self._log_debug(f"Running command: {command}")
-        result = subprocess.run(
-            parts,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        if any(op in command for op in ["|", ";", "&&", "||", ">", "<"]):
+            result = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/sh",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        else:
+            parts = shlex.split(command)
+            result = subprocess.run(
+                parts,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
         output = result.stdout.strip()
         if result.stderr:
             output = f"{output}\n{result.stderr.strip()}".strip()
@@ -221,6 +388,10 @@ class CodoorVoIP:
         context.append("\n=== RECENT LOGS (last 10 lines) ===")
         context.append(logs)
 
+        if self.last_command_outputs:
+            context.append("\n=== LAST COMMAND OUTPUTS ===")
+            context.extend(self.last_command_outputs[-5:])
+
         return "\n".join(context)
 
     def ask_ai(self, user_prompt: str, context: Optional[str] = None) -> str:
@@ -260,16 +431,35 @@ class CodoorVoIP:
         }
 
         self._log_debug("Sending request to DeepSeek API")
-        response = requests.post(
-            self.api_url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=30,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(f"API error {response.status_code}: {response.text}")
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        timer = None
+        if sys.stdout.isatty():
+            timer = self._start_timer("Thinking")
+        try:
+            last_error = None
+            for attempt in range(3):
+                try:
+                    response = requests.post(
+                        self.api_url,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        json=payload,
+                        timeout=45,
+                    )
+                    if response.status_code != 200:
+                        raise RuntimeError(f"API error {response.status_code}: {response.text}")
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"]
+                except requests.exceptions.Timeout as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        continue
+                except requests.exceptions.RequestException as exc:
+                    last_error = exc
+                    break
+            raise RuntimeError(f"Request failed: {last_error}")
+        finally:
+            if timer:
+                timer["stop"].set()
+                timer["thread"].join()
 
     # ==================== RESPONSE PARSING & APPLY ====================
 
@@ -278,7 +468,13 @@ class CodoorVoIP:
         for line in response.splitlines():
             line = line.strip()
             if line.startswith("CMD:"):
-                commands.append(line[len("CMD:") :].strip())
+                command = line[len("CMD:") :].strip()
+                # Strip backticks and trailing explanations.
+                if " - " in command:
+                    command = command.split(" - ", 1)[0].strip()
+                if command.startswith("`") and command.endswith("`"):
+                    command = command[1:-1].strip()
+                commands.append(command)
         return commands
 
     def parse_changes(self, response: str) -> List[Dict[str, str]]:
@@ -354,6 +550,7 @@ class CodoorVoIP:
         response = self.ask_ai(user_prompt)
         commands = self.parse_commands(response)
         changes = self.parse_changes(response)
+        ran_command = False
 
         if not commands and not changes:
             print(response)
@@ -367,8 +564,15 @@ class CodoorVoIP:
                     try:
                         output = self.run_command(cmd)
                         print(output)
+                        self.last_command_outputs.append(f"$ {cmd}\n{output}")
+                        self.last_commands_run.append(cmd)
+                        ran_command = True
                     except Exception as exc:
-                        print(f"Command failed: {exc}")
+                        error_text = f"Command failed: {exc}"
+                        print(error_text)
+                        self.last_command_outputs.append(f"$ {cmd}\n{error_text}")
+                        self.last_commands_run.append(cmd)
+                        ran_command = True
 
         if changes:
             print("\nProposed file changes:")
@@ -381,6 +585,53 @@ class CodoorVoIP:
             confirm = input("\nApply these changes? [y/N]: ").strip().lower()
             if confirm in ["y", "yes"]:
                 self.apply_changes(changes)
+
+        if ran_command:
+            print("\nContinuing analysis with command outputs...")
+            executed = "\n".join(f"- {cmd}" for cmd in self.last_commands_run[-10:])
+            followup_prompt = (
+                f"{user_prompt}\n\n"
+                "Use the recent command outputs to continue the analysis and answer the request. "
+                "Avoid repeating commands already executed unless you explain why.\n\n"
+                f"Already executed commands:\n{executed}\n"
+            )
+            followup_response = self.ask_ai(followup_prompt)
+            followup_commands = self.parse_commands(followup_response)
+            followup_changes = self.parse_changes(followup_response)
+
+            print("\nFollow-up response:")
+            print(followup_response)
+
+            if not followup_commands and not followup_changes:
+                return
+
+            if followup_commands:
+                print("\nFollow-up commands:")
+                for cmd in followup_commands:
+                    answer = input(f"Run '{cmd}'? [y/N]: ").strip().lower()
+                    if answer in ["y", "yes"]:
+                        try:
+                            output = self.run_command(cmd)
+                            print(output)
+                            self.last_command_outputs.append(f"$ {cmd}\n{output}")
+                            self.last_commands_run.append(cmd)
+                        except Exception as exc:
+                            error_text = f"Command failed: {exc}"
+                            print(error_text)
+                            self.last_command_outputs.append(f"$ {cmd}\n{error_text}")
+                            self.last_commands_run.append(cmd)
+
+            if followup_changes:
+                print("\nFollow-up file changes:")
+                for change in followup_changes:
+                    print(f"\n--- {change['file']} ---")
+                    print(change["code"][:500])
+                    if len(change["code"]) > 500:
+                        print("... (truncated)")
+
+                confirm = input("\nApply these changes? [y/N]: ").strip().lower()
+                if confirm in ["y", "yes"]:
+                    self.apply_changes(followup_changes)
 
     def interactive_mode(self) -> None:
         print("\nCodoor-VoIP Interactive Mode")
