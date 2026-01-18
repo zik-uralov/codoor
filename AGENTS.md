@@ -5,10 +5,10 @@ Project goal
 - Connect Zoiper (LAN, different subnet) to FreePBX for outbound calls to mobile numbers.
 
 Current setup
-- FreePBX version: unknown (use `fwconsole --version` to confirm)
-- Distro: unknown (use `cat /etc/os-release` to confirm)
-- Asterisk version: unknown (use `asterisk -rx "core show version"` to confirm)
-- Channel driver: PJSIP
+- FreePBX version: unknown (fwconsole not found in this environment; run `fwconsole --version` on the PBX host)
+- Distro: Linux Mint 22.2 (PRETTY_NAME from /etc/os-release)
+- Asterisk version: unknown (asterisk CLI not found here; run `asterisk -rx "core show version"` on the PBX host)
+- Channel driver: PJSIP (per user)
 
 Network notes
 - LAN: same site; different subnet for Zoiper
@@ -16,8 +16,8 @@ Network notes
 - SIP/RTP ports: unknown (confirm 5060/5061 and RTP range, e.g. 10000-20000)
 
 Trunks and routes
-- Outbound route(s): unknown (check `extensions_additional.conf` sections `outrt-*`)
-- Trunks: unknown (check `pjsip.conf` sections `trunk-*`)
+- Outbound route(s): unknown (check `extensions_additional.conf` sections `outrt-*` on the PBX host)
+- Trunks: unknown (check `pjsip.conf` sections `trunk-*` on the PBX host)
 - Naming conventions: none documented
 
 Zoiper extension details

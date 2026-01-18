@@ -30,6 +30,7 @@ class CodoorVoIP:
         self.model = self._get_setting("model", "deepseek-chat")
         self.api_key = api_key or self._get_setting("api_key", "") or os.getenv("DEEPSEEK_API_KEY", "")
         self._ensure_llm_settings()
+        self._update_environment_settings()
 
         if not self.api_key and "localhost" not in self.api_url:
             raise ValueError("API key not provided. Set it in setup or DEEPSEEK_API_KEY.")
@@ -116,7 +117,7 @@ class CodoorVoIP:
     def _save_settings(self, settings: Dict[str, object]) -> None:
         settings_path = self._settings_path()
         settings_path.write_text(
-            json.dumps(settings, indent=2, sort_keys=True),
+            json.dumps(settings, indent=2),
             encoding="utf-8",
         )
 
@@ -191,6 +192,43 @@ class CodoorVoIP:
     def _log_debug(self, message: str) -> None:
         if self.verbose:
             print(f"[debug] {message}")
+
+    def _get_freepbx_version(self) -> str:
+        try:
+            return self.run_command("fwconsole --version")
+        except Exception:
+            return "Unknown"
+
+    def _get_asterisk_version(self) -> str:
+        try:
+            return self.run_command("asterisk -rx 'core show version'")
+        except Exception:
+            return "Unknown"
+
+    def _update_environment_settings(self) -> None:
+        settings = self._load_settings()
+        env = settings.get("environment", {}) if isinstance(settings, dict) else {}
+        os_release = self._read_text_file(Path("/etc/os-release"))
+
+        env["os"] = self._parse_os_release(os_release) or "Unknown"
+        env["freepbx_version"] = self._get_freepbx_version()
+        env["asterisk_version"] = self._get_asterisk_version()
+        env["channel_drivers"] = self._detect_channel_drivers()
+        routes_trunks = self._summarize_routes_trunks()
+        env["outbound_routes"] = routes_trunks.get("outbound_routes", "Unknown")
+        env["trunks"] = routes_trunks.get("trunks", "Unknown")
+        env["last_updated"] = datetime.now().isoformat()
+
+        new_settings: Dict[str, object] = {}
+        new_settings["environment"] = env
+        if "llm" in settings:
+            new_settings["llm"] = settings["llm"]
+        for key, value in settings.items():
+            if key not in {"environment", "llm"}:
+                new_settings[key] = value
+
+        self._save_settings(new_settings)
+        self.settings = new_settings
 
     def _read_text_file(self, path: Path, max_chars: int = 10000) -> str:
         try:
@@ -365,9 +403,9 @@ class CodoorVoIP:
         os_release = self._read_text_file(Path("/etc/os-release"))
         status["os"]["release"] = self._parse_os_release(os_release) or "Unknown"
         try:
-            status["freepbx"]["version"] = self.run_command("fwconsole --version")
-        except Exception as exc:
-            status["freepbx"]["version"] = f"Unknown ({exc})"
+            status["freepbx"]["version"] = self._get_freepbx_version()
+        except Exception:
+            status["freepbx"]["version"] = "Unknown"
 
         try:
             status["asterisk"]["version"] = self.run_command("asterisk -rx 'core show version'")
