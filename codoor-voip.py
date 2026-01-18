@@ -198,6 +198,12 @@ class CodoorVoIP:
         except Exception:
             return ""
 
+    def _load_agents_memory(self, max_chars: int = 3000) -> str:
+        memory_path = Path("AGENTS.md")
+        if not memory_path.exists():
+            return ""
+        return self._read_text_file(memory_path, max_chars=max_chars).strip()
+
     def _parse_os_release(self, text: str) -> str:
         for line in text.splitlines():
             if line.startswith("PRETTY_NAME="):
@@ -448,7 +454,11 @@ class CodoorVoIP:
     def build_system_context(self) -> str:
         """Build a compact system context snapshot for the AI."""
         context = []
+        agents_memory = self._load_agents_memory()
         status = self.get_system_status()
+        if agents_memory:
+            context.append("=== AGENTS MEMORY ===")
+            context.append(agents_memory)
         context.append("=== PLATFORM ===")
         context.append(f"OS: {status['os'].get('release', 'Unknown')}")
         context.append(f"FreePBX: {status['freepbx'].get('version', 'Unknown')}")
