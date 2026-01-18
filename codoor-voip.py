@@ -192,6 +192,73 @@ class CodoorVoIP:
         if self.verbose:
             print(f"[debug] {message}")
 
+    def _read_text_file(self, path: Path, max_chars: int = 10000) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+        except Exception:
+            return ""
+
+    def _parse_os_release(self, text: str) -> str:
+        for line in text.splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+        return ""
+
+    def _detect_channel_drivers(self) -> str:
+        pjsip = "unknown"
+        chan_sip = "unknown"
+        try:
+            pjsip_output = self.run_command("asterisk -rx 'module show like pjsip'")
+            pjsip = "running" if "pjsip" in pjsip_output else "not found"
+        except Exception:
+            pjsip = "error"
+        try:
+            chan_sip_output = self.run_command("asterisk -rx 'module show like chan_sip'")
+            chan_sip = "running" if "chan_sip" in chan_sip_output else "not found"
+        except Exception:
+            chan_sip = "error"
+        return f"pjsip={pjsip}, chan_sip={chan_sip}"
+
+    def _extract_section_names(self, path: Path, prefix: str, max_items: int = 5) -> List[str]:
+        if not path.exists():
+            return []
+        found: List[str] = []
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line.startswith("[") and line.endswith("]"):
+                        name = line[1:-1].strip()
+                        if name.startswith(prefix):
+                            found.append(name)
+                            if len(found) >= max_items:
+                                break
+        except Exception:
+            return []
+        return found
+
+    def _summarize_routes_trunks(self) -> Dict[str, str]:
+        routes = self._extract_section_names(
+            Path(self.paths["config"]) / "extensions_additional.conf",
+            "outrt-",
+        )
+        pjsip_trunks = self._extract_section_names(
+            Path(self.paths["config"]) / "pjsip.conf",
+            "trunk-",
+        )
+        chan_sip_trunks = self._extract_section_names(
+            Path(self.paths["config"]) / "sip.conf",
+            "trunk-",
+        )
+        route_summary = "none detected" if not routes else f"{len(routes)} found (e.g. {', '.join(routes)})"
+        trunk_names = pjsip_trunks + chan_sip_trunks
+        trunk_summary = (
+            "none detected"
+            if not trunk_names
+            else f"{len(trunk_names)} found (e.g. {', '.join(trunk_names)})"
+        )
+        return {"outbound_routes": route_summary, "trunks": trunk_summary}
+
     def _is_allowed_path(self, path: Path) -> bool:
         # Limit file changes to the Asterisk config directory.
         config_root = Path(self.paths["config"]).resolve()
@@ -279,12 +346,22 @@ class CodoorVoIP:
         """Get basic FreePBX/Asterisk system status."""
         status = {
             "timestamp": datetime.now().isoformat(),
+            "os": {},
+            "freepbx": {},
             "asterisk": {},
+            "telephony": {},
             "network": {},
             "services": {},
             "storage": {},
             "configuration": {},
         }
+
+        os_release = self._read_text_file(Path("/etc/os-release"))
+        status["os"]["release"] = self._parse_os_release(os_release) or "Unknown"
+        try:
+            status["freepbx"]["version"] = self.run_command("fwconsole --version")
+        except Exception as exc:
+            status["freepbx"]["version"] = f"Unknown ({exc})"
 
         try:
             status["asterisk"]["version"] = self.run_command("asterisk -rx 'core show version'")
@@ -301,6 +378,9 @@ class CodoorVoIP:
             )[:500]
         except Exception as exc:
             status["asterisk"]["error"] = str(exc)
+
+        status["telephony"]["channel_drivers"] = self._detect_channel_drivers()
+        status["telephony"].update(self._summarize_routes_trunks())
 
         try:
             status["network"]["interfaces"] = self.run_command("ip addr show")
@@ -369,6 +449,12 @@ class CodoorVoIP:
         """Build a compact system context snapshot for the AI."""
         context = []
         status = self.get_system_status()
+        context.append("=== PLATFORM ===")
+        context.append(f"OS: {status['os'].get('release', 'Unknown')}")
+        context.append(f"FreePBX: {status['freepbx'].get('version', 'Unknown')}")
+        context.append(f"Channel drivers: {status['telephony'].get('channel_drivers', 'Unknown')}")
+        context.append(f"Outbound routes: {status['telephony'].get('outbound_routes', 'Unknown')}")
+        context.append(f"Trunks: {status['telephony'].get('trunks', 'Unknown')}")
         context.append("=== SYSTEM STATUS ===")
         context.append(f"Asterisk: {status['asterisk'].get('version', 'Unknown')}")
         context.append(f"Uptime: {status['asterisk'].get('uptime', 'Unknown')}")
