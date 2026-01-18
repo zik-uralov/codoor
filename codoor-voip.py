@@ -30,7 +30,6 @@ class CodoorVoIP:
         self.model = self._get_setting("model", "deepseek-chat")
         self.api_key = api_key or self._get_setting("api_key", "") or os.getenv("DEEPSEEK_API_KEY", "")
         self._ensure_llm_settings()
-        self._update_environment_settings()
 
         if not self.api_key and "localhost" not in self.api_url:
             raise ValueError("API key not provided. Set it in setup or DEEPSEEK_API_KEY.")
@@ -49,6 +48,7 @@ class CodoorVoIP:
             "spool": "/var/spool/asterisk",
             "freepbx_db": "/var/lib/asterisk",
         }
+        self._update_environment_settings()
 
         # Safe commands allowed for execution.
         self.safe_commands = [
