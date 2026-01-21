@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict
 
@@ -20,6 +20,8 @@ class Codoor:
             self._ensure_llm_settings()
         self.client = self._init_client() if init_client else None
         self.conversation = []
+        self.approvals = self._load_approvals()
+        self.approval_ttl = timedelta(days=7)
 
     def _settings_path(self) -> Path:
         return Path(".codoor_settings.json")
@@ -39,6 +41,59 @@ class Codoor:
             json.dumps(settings, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+    def _load_approvals(self) -> Dict[str, Dict[str, str]]:
+        settings = self._load_settings()
+        approvals = settings.get("approvals", {}) if isinstance(settings, dict) else {}
+        files = approvals.get("files", {}) if isinstance(approvals, dict) else {}
+        return {"files": files if isinstance(files, dict) else {}}
+
+    def _save_approvals(self) -> None:
+        settings = self._load_settings()
+        settings["approvals"] = self.approvals
+        self._save_settings(settings)
+
+    def _approval_is_valid(self, approved_at: str) -> bool:
+        try:
+            timestamp = datetime.fromisoformat(approved_at)
+        except ValueError:
+            return False
+        return datetime.now() - timestamp <= self.approval_ttl
+
+    def _prune_approvals(self) -> None:
+        entries = self.approvals.get("files", {})
+        if not isinstance(entries, dict):
+            self.approvals["files"] = {}
+            self._save_approvals()
+            return
+        valid = {item: ts for item, ts in entries.items() if self._approval_is_valid(ts)}
+        if len(valid) != len(entries):
+            self.approvals["files"] = valid
+            self._save_approvals()
+
+    def _is_file_approved(self, path: Path) -> bool:
+        self._prune_approvals()
+        resolved = str(path.expanduser().resolve())
+        approved_at = self.approvals.get("files", {}).get(resolved)
+        return bool(approved_at and self._approval_is_valid(approved_at))
+
+    def _record_file_approval(self, path: Path) -> None:
+        resolved = str(path.expanduser().resolve())
+        self.approvals.setdefault("files", {})[resolved] = datetime.now().isoformat()
+        self._save_approvals()
+
+    def _ensure_file_approvals(self, files: List[str]) -> List[str]:
+        approved: List[str] = []
+        for file_path in files:
+            resolved = Path(file_path).expanduser().resolve()
+            if self._is_file_approved(resolved):
+                approved.append(str(resolved))
+                continue
+            answer = input(f"Allow file read/write for {resolved}? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                self._record_file_approval(resolved)
+                approved.append(str(resolved))
+        return approved
 
     def _ensure_llm_settings(self) -> None:
         """Run a first-time setup if no API key is configured."""
@@ -237,6 +292,8 @@ class Codoor:
             resolved = self._resolve_path(filepath)
             if not self._is_allowed_path(resolved):
                 return "[Not allowed]"
+            if not self._is_file_approved(resolved):
+                return "[Not approved]"
             with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read(max_chars)
         except Exception:
@@ -292,8 +349,7 @@ class Codoor:
             f"User request: {user_input}\n\n"
             "List the specific files that should be edited or created to satisfy the request.\n"
             "Return only a newline-separated list of file paths. No explanations, no bullets.\n"
-            "Prefer FreePBX/Asterisk *_custom.conf files over auto-generated files (e.g., sip_custom.conf, "
-            "pjsip_custom.conf, extensions_custom.conf).\n"
+            "Prefer Asterisk configuration under /etc/asterisk; avoid auto-generated files when possible.\n"
             "If the request is about server configuration and no project files match, "
             "suggest the typical config files under the allowed paths.\n"
             "If no files should be changed, return an empty response.\n"
@@ -349,7 +405,6 @@ class Codoor:
 
     def _request_needs_system_paths(self, user_input: str) -> bool:
         keywords = [
-            "freepbx",
             "asterisk",
             "voip",
             "pjsip",
@@ -443,6 +498,13 @@ class Codoor:
             if not self._is_allowed_path(file_path):
                 print(f"⛔ Skipping (not allowed): {file_path}")
                 continue
+            if not self._is_file_approved(file_path):
+                answer = input(f"Allow file write for {file_path}? [Y/n]: ").strip().lower()
+                if answer in ("", "y", "yes"):
+                    self._record_file_approval(file_path)
+                else:
+                    print(f"⛔ Skipping (not approved): {file_path}")
+                    continue
 
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -467,8 +529,11 @@ class Codoor:
         """Run a single command."""
         print(f"\n🤔 Request: {user_input}")
 
-        print("📁 Scanning project...")
-        project_files = self.scan_project(include_files=include_files)
+        needs_system_paths = self._request_needs_system_paths(user_input)
+        project_files: List[str] = []
+        if not needs_system_paths or include_files:
+            print("📁 Scanning project...")
+            project_files = self.scan_project(include_files=include_files)
 
         if project_files:
             print(f"   Found {len(project_files)} files")
@@ -478,6 +543,9 @@ class Codoor:
                 print(f"   ... and {len(project_files) - 3} more")
         else:
             print("   No code files found (working in empty directory)")
+
+        if project_files:
+            project_files = self._ensure_file_approvals(project_files)
 
         print("🧭 Discovering target files...")
         allowed_paths = self.config["project"].get("allow_paths", [])
@@ -512,12 +580,11 @@ class Codoor:
             for file_path in unwritable:
                 print(f"   • {file_path}")
 
-        approved_files: List[str] = []
-        print("\nProposed files:")
-        for file_path in suggested_files:
-            answer = input(f"Allow {file_path}? [Y/n]: ").strip().lower()
-            if answer in ["", "y", "yes"]:
-                approved_files.append(file_path)
+        if suggested_files:
+            print("\nProposed files:")
+            for file_path in suggested_files:
+                print(f"   • {file_path}")
+        approved_files = self._ensure_file_approvals(suggested_files)
 
         if not approved_files:
             print("❌ No files approved; stopping.")

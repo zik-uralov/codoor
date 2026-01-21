@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codoor-VoIP v1.0 - AI-Powered FreePBX/Asterisk Administration Assistant
+Codoor-VoIP v1.0 - AI-Powered Asterisk Administration Assistant
 """
 
 import argparse
@@ -12,7 +12,7 @@ import time
 import re
 import shlex
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -25,6 +25,8 @@ class CodoorVoIP:
         Initialize Codoor-VoIP assistant.
         """
         self.settings = self._load_settings()
+        self.approvals = self._load_approvals()
+        self.approval_ttl = timedelta(days=7)
         base_url = self._get_setting("base_url", "https://api.deepseek.com")
         self.api_url = self._normalize_api_url(base_url)
         self.model = self._get_setting("model", "deepseek-chat")
@@ -38,7 +40,7 @@ class CodoorVoIP:
         self.last_command_outputs: List[str] = []
         self.last_commands_run: List[str] = []
 
-        # FreePBX/Asterisk paths.
+        # Asterisk paths.
         self.paths = {
             "config": "/etc/asterisk",
             "logs": "/var/log/asterisk",
@@ -46,14 +48,13 @@ class CodoorVoIP:
             "modules": "/var/lib/asterisk/modules",
             "agi": "/var/lib/asterisk/agi-bin",
             "spool": "/var/spool/asterisk",
-            "freepbx_db": "/var/lib/asterisk",
         }
-        self._update_environment_settings()
+        self.approved_commands: List[str] = []
+        self.approved_files: List[str] = []
 
         # Safe commands allowed for execution.
         self.safe_commands = [
             "asterisk",
-            "fwconsole",
             "systemctl",
             "ip",
             "ping",
@@ -74,7 +75,6 @@ class CodoorVoIP:
             "iptables",
             "ufw",
             "mysql",
-            "amportal",
             "rsync",
             "tar",
             "gzip",
@@ -84,7 +84,7 @@ class CodoorVoIP:
 
         print("Codoor-VoIP v1.0 Initialized")
         print(f"API: {self.api_url} | Model: {self.model}")
-        print(f"FreePBX Path: {self.paths['config']}")
+        print(f"Asterisk Config Path: {self.paths['config']}")
 
     def _start_timer(self, message: str = "Thinking") -> Dict[str, object]:
         # Elapsed timer to show progress during LLM calls.
@@ -120,6 +120,88 @@ class CodoorVoIP:
             json.dumps(settings, indent=2),
             encoding="utf-8",
         )
+
+    def _load_approvals(self) -> Dict[str, Dict[str, str]]:
+        settings = self._load_settings()
+        approvals = settings.get("approvals", {}) if isinstance(settings, dict) else {}
+        files = approvals.get("files", {}) if isinstance(approvals, dict) else {}
+        commands = approvals.get("commands", {}) if isinstance(approvals, dict) else {}
+        return {
+            "files": files if isinstance(files, dict) else {},
+            "commands": commands if isinstance(commands, dict) else {},
+        }
+
+    def _save_approvals(self) -> None:
+        settings = self._load_settings()
+        settings["approvals"] = self.approvals
+        self._save_settings(settings)
+
+    def _approval_is_valid(self, approved_at: str) -> bool:
+        try:
+            timestamp = datetime.fromisoformat(approved_at)
+        except ValueError:
+            return False
+        return datetime.now() - timestamp <= self.approval_ttl
+
+    def _prune_approvals(self) -> None:
+        changed = False
+        for key in ("files", "commands"):
+            entries = self.approvals.get(key, {})
+            if not isinstance(entries, dict):
+                self.approvals[key] = {}
+                changed = True
+                continue
+            valid = {item: ts for item, ts in entries.items() if self._approval_is_valid(ts)}
+            if len(valid) != len(entries):
+                self.approvals[key] = valid
+                changed = True
+        if changed:
+            self._save_approvals()
+
+    def _is_file_approved(self, path: Path) -> bool:
+        self._prune_approvals()
+        resolved = str(path.expanduser().resolve())
+        approved_at = self.approvals.get("files", {}).get(resolved)
+        return bool(approved_at and self._approval_is_valid(approved_at))
+
+    def _is_command_approved(self, command: str) -> bool:
+        self._prune_approvals()
+        approved_at = self.approvals.get("commands", {}).get(command)
+        return bool(approved_at and self._approval_is_valid(approved_at))
+
+    def _record_file_approval(self, path: Path) -> None:
+        resolved = str(path.expanduser().resolve())
+        self.approvals.setdefault("files", {})[resolved] = datetime.now().isoformat()
+        self._save_approvals()
+
+    def _record_command_approval(self, command: str) -> None:
+        self.approvals.setdefault("commands", {})[command] = datetime.now().isoformat()
+        self._save_approvals()
+
+    def _ensure_file_approvals(self, files: List[str]) -> List[str]:
+        approved: List[str] = []
+        for file_path in files:
+            resolved = Path(file_path).expanduser().resolve()
+            if self._is_file_approved(resolved):
+                approved.append(str(resolved))
+                continue
+            answer = input(f"Allow file read/write for {resolved}? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                self._record_file_approval(resolved)
+                approved.append(str(resolved))
+        return approved
+
+    def _ensure_command_approvals(self, commands: List[str]) -> List[str]:
+        approved: List[str] = []
+        for command in commands:
+            if self._is_command_approved(command):
+                approved.append(command)
+                continue
+            answer = input(f"Allow command execution: {command}? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                self._record_command_approval(command)
+                approved.append(command)
+        return approved
 
     def _get_setting(self, key: str, default: str) -> str:
         llm = self.settings.get("llm", {}) if isinstance(self.settings, dict) else {}
@@ -193,12 +275,6 @@ class CodoorVoIP:
         if self.verbose:
             print(f"[debug] {message}")
 
-    def _get_freepbx_version(self) -> str:
-        try:
-            return self.run_command("fwconsole --version")
-        except Exception:
-            return "Unknown"
-
     def _get_asterisk_version(self) -> str:
         try:
             return self.run_command("asterisk -rx 'core show version'")
@@ -211,12 +287,11 @@ class CodoorVoIP:
         os_release = self._read_text_file(Path("/etc/os-release"))
 
         env["os"] = self._parse_os_release(os_release) or "Unknown"
-        env["freepbx_version"] = self._get_freepbx_version()
         env["asterisk_version"] = self._get_asterisk_version()
         env["channel_drivers"] = self._detect_channel_drivers()
-        routes_trunks = self._summarize_routes_trunks()
-        env["outbound_routes"] = routes_trunks.get("outbound_routes", "Unknown")
-        env["trunks"] = routes_trunks.get("trunks", "Unknown")
+        dialplan_endpoints = self._summarize_dialplan_and_endpoints()
+        env["dialplan_contexts"] = dialplan_endpoints.get("dialplan_contexts", "Unknown")
+        env["endpoints"] = dialplan_endpoints.get("endpoints", "Unknown")
         env["last_updated"] = datetime.now().isoformat()
 
         new_settings: Dict[str, object] = {}
@@ -263,8 +338,44 @@ class CodoorVoIP:
             chan_sip = "error"
         return f"pjsip={pjsip}, chan_sip={chan_sip}"
 
+    def _suggest_requirements(self, user_prompt: str) -> Dict[str, List[str]]:
+        lowered = user_prompt.lower()
+        keywords = [
+            "asterisk",
+            "pjsip",
+            "sip",
+            "trunk",
+            "dialplan",
+            "extension",
+            "did",
+            "call",
+            "inbound",
+            "outbound",
+            "obi",
+        ]
+        if not any(word in lowered for word in keywords):
+            return {"files": [], "commands": []}
+
+        files = [
+            "/etc/asterisk/pjsip.conf",
+            "/etc/asterisk/extensions.conf",
+            "/etc/asterisk/extensions_custom.conf",
+        ]
+        commands = [
+            "asterisk -rx 'core show version'",
+            "asterisk -rx 'core show uptime'",
+            "asterisk -rx 'core show channels'",
+            "asterisk -rx 'module show like pjsip'",
+            "asterisk -rx 'module show like chan_sip'",
+            "asterisk -rx 'pjsip show endpoints'",
+            "asterisk -rx 'pjsip show registrations'",
+        ]
+        return {"files": files, "commands": commands}
+
     def _extract_section_names(self, path: Path, prefix: str, max_items: int = 5) -> List[str]:
         if not path.exists():
+            return []
+        if not self._is_file_approved(path):
             return []
         found: List[str] = []
         try:
@@ -281,27 +392,93 @@ class CodoorVoIP:
             return []
         return found
 
-    def _summarize_routes_trunks(self) -> Dict[str, str]:
-        routes = self._extract_section_names(
-            Path(self.paths["config"]) / "extensions_additional.conf",
-            "outrt-",
-        )
-        pjsip_trunks = self._extract_section_names(
-            Path(self.paths["config"]) / "pjsip.conf",
-            "trunk-",
-        )
-        chan_sip_trunks = self._extract_section_names(
-            Path(self.paths["config"]) / "sip.conf",
-            "trunk-",
-        )
-        route_summary = "none detected" if not routes else f"{len(routes)} found (e.g. {', '.join(routes)})"
-        trunk_names = pjsip_trunks + chan_sip_trunks
-        trunk_summary = (
-            "none detected"
-            if not trunk_names
-            else f"{len(trunk_names)} found (e.g. {', '.join(trunk_names)})"
-        )
-        return {"outbound_routes": route_summary, "trunks": trunk_summary}
+    def _extract_dialplan_contexts(self, paths: List[Path], max_items: int = 5) -> List[str]:
+        contexts: List[str] = []
+        skip = {"general", "globals"}
+        for path in paths:
+            for name in self._extract_section_names(path, "", max_items=max_items):
+                if name in skip or name in contexts:
+                    continue
+                contexts.append(name)
+                if len(contexts) >= max_items:
+                    return contexts
+        return contexts
+
+    def _extract_pjsip_endpoints(self, path: Path, max_items: int = 5) -> List[str]:
+        if not path.exists():
+            return []
+        if not self._is_file_approved(path):
+            return []
+        endpoints: List[str] = []
+        current_section: Optional[str] = None
+        is_endpoint = False
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if stripped.startswith("[") and stripped.endswith("]"):
+                        if current_section and is_endpoint and current_section not in endpoints:
+                            endpoints.append(current_section)
+                            if len(endpoints) >= max_items:
+                                return endpoints
+                        current_section = stripped[1:-1].strip()
+                        is_endpoint = False
+                        continue
+                    if current_section and stripped.lower().startswith("type="):
+                        is_endpoint = stripped.split("=", 1)[1].strip().lower() == "endpoint"
+        except Exception:
+            return []
+        if current_section and is_endpoint and current_section not in endpoints:
+            endpoints.append(current_section)
+        return endpoints[:max_items]
+
+    def _extract_sip_peers(self, path: Path, max_items: int = 5) -> List[str]:
+        if not path.exists():
+            return []
+        if not self._is_file_approved(path):
+            return []
+        peers: List[str] = []
+        current_section: Optional[str] = None
+        is_peer = False
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if stripped.startswith("[") and stripped.endswith("]"):
+                        if current_section and is_peer and current_section not in peers:
+                            peers.append(current_section)
+                            if len(peers) >= max_items:
+                                return peers
+                        current_section = stripped[1:-1].strip()
+                        is_peer = False
+                        continue
+                    if current_section and stripped.lower().startswith("type="):
+                        value = stripped.split("=", 1)[1].strip().lower()
+                        is_peer = value in {"peer", "friend"}
+        except Exception:
+            return []
+        if current_section and is_peer and current_section not in peers:
+            peers.append(current_section)
+        return peers[:max_items]
+
+    def _summarize_dialplan_and_endpoints(self) -> Dict[str, str]:
+        context_paths = [
+            Path(self.paths["config"]) / "extensions.conf",
+            Path(self.paths["config"]) / "extensions_custom.conf",
+        ]
+        contexts = self._extract_dialplan_contexts(context_paths)
+        pjsip_endpoints = self._extract_pjsip_endpoints(Path(self.paths["config"]) / "pjsip.conf")
+        chan_sip_peers = self._extract_sip_peers(Path(self.paths["config"]) / "sip.conf")
+
+        context_summary = "none detected" if not contexts else f"{len(contexts)} found (e.g. {', '.join(contexts)})"
+        endpoint_chunks = []
+        if pjsip_endpoints:
+            endpoint_chunks.append(f"pjsip={len(pjsip_endpoints)} (e.g. {', '.join(pjsip_endpoints)})")
+        if chan_sip_peers:
+            endpoint_chunks.append(f"chan_sip={len(chan_sip_peers)} (e.g. {', '.join(chan_sip_peers)})")
+        endpoint_summary = "none detected" if not endpoint_chunks else "; ".join(endpoint_chunks)
+
+        return {"dialplan_contexts": context_summary, "endpoints": endpoint_summary}
 
     def _is_allowed_path(self, path: Path) -> bool:
         # Limit file changes to the Asterisk config directory.
@@ -358,6 +535,8 @@ class CodoorVoIP:
         """Run a whitelisted command and return output."""
         if not command.strip():
             raise ValueError("Empty command.")
+        if command not in self.approved_commands and not self._is_command_approved(command):
+            raise ValueError("Command not approved.")
         if not self._is_safe_shell_command(command):
             raise ValueError("Command not allowed.")
 
@@ -386,12 +565,16 @@ class CodoorVoIP:
             output = f"{output}\n{result.stderr.strip()}".strip()
         return output
 
+    def _run_if_approved(self, command: str, timeout: int = 10) -> str:
+        if command not in self.approved_commands and not self._is_command_approved(command):
+            return "Not approved"
+        return self.run_command(command, timeout=timeout)
+
     def get_system_status(self) -> Dict[str, Dict[str, str]]:
-        """Get basic FreePBX/Asterisk system status."""
+        """Get basic Asterisk system status."""
         status = {
             "timestamp": datetime.now().isoformat(),
             "os": {},
-            "freepbx": {},
             "asterisk": {},
             "telephony": {},
             "network": {},
@@ -403,20 +586,15 @@ class CodoorVoIP:
         os_release = self._read_text_file(Path("/etc/os-release"))
         status["os"]["release"] = self._parse_os_release(os_release) or "Unknown"
         try:
-            status["freepbx"]["version"] = self._get_freepbx_version()
-        except Exception:
-            status["freepbx"]["version"] = "Unknown"
-
-        try:
-            status["asterisk"]["version"] = self.run_command("asterisk -rx 'core show version'")
-            status["asterisk"]["uptime"] = self.run_command("asterisk -rx 'core show uptime'")
-            status["asterisk"]["sip_registrations"] = self.run_command("asterisk -rx 'sip show registry'")
-            status["asterisk"]["pjsip_endpoints"] = self.run_command(
+            status["asterisk"]["version"] = self._run_if_approved("asterisk -rx 'core show version'")
+            status["asterisk"]["uptime"] = self._run_if_approved("asterisk -rx 'core show uptime'")
+            status["asterisk"]["registrations"] = self._run_if_approved("asterisk -rx 'pjsip show registrations'")
+            status["asterisk"]["pjsip_endpoints"] = self._run_if_approved(
                 "asterisk -rx 'pjsip show endpoints'",
                 timeout=5,
             )[:1000]
-            status["asterisk"]["active_channels"] = self.run_command("asterisk -rx 'core show channels'")
-            status["asterisk"]["modules"] = self.run_command(
+            status["asterisk"]["active_channels"] = self._run_if_approved("asterisk -rx 'core show channels'")
+            status["asterisk"]["modules"] = self._run_if_approved(
                 "asterisk -rx 'module show'",
                 timeout=5,
             )[:500]
@@ -424,26 +602,26 @@ class CodoorVoIP:
             status["asterisk"]["error"] = str(exc)
 
         status["telephony"]["channel_drivers"] = self._detect_channel_drivers()
-        status["telephony"].update(self._summarize_routes_trunks())
+        status["telephony"].update(self._summarize_dialplan_and_endpoints())
 
         try:
-            status["network"]["interfaces"] = self.run_command("ip addr show")
-            status["network"]["sip_ports"] = self.run_command(
+            status["network"]["interfaces"] = self._run_if_approved("ip addr show")
+            status["network"]["sip_ports"] = self._run_if_approved(
                 "ss -tuln | grep -E ':(5060|5061|10000)'",
             )
         except Exception as exc:
             status["network"]["error"] = str(exc)
 
         try:
-            status["services"]["asterisk"] = self.run_command("systemctl status asterisk --no-pager -l")
-            status["services"]["httpd"] = self.run_command("systemctl status httpd --no-pager -l")
-            status["services"]["mariadb"] = self.run_command("systemctl status mariadb --no-pager -l")
+            status["services"]["asterisk"] = self._run_if_approved("systemctl status asterisk --no-pager -l")
+            status["services"]["httpd"] = self._run_if_approved("systemctl status httpd --no-pager -l")
+            status["services"]["mariadb"] = self._run_if_approved("systemctl status mariadb --no-pager -l")
         except Exception as exc:
             status["services"]["error"] = str(exc)
 
         try:
-            status["storage"]["disks"] = self.run_command("df -h / /var /var/log")
-            status["storage"]["asterisk_dirs"] = self.run_command(
+            status["storage"]["disks"] = self._run_if_approved("df -h / /var /var/log")
+            status["storage"]["asterisk_dirs"] = self._run_if_approved(
                 "du -sh /etc/asterisk /var/lib/asterisk",
             )
         except Exception as exc:
@@ -452,7 +630,7 @@ class CodoorVoIP:
         return status
 
     def get_config_summary(self) -> Dict[str, str]:
-        """Summarize key FreePBX/Asterisk configurations."""
+        """Summarize key Asterisk configurations."""
         summary: Dict[str, str] = {}
         config_dir = Path(self.paths["config"])
 
@@ -469,6 +647,8 @@ class CodoorVoIP:
 
         for filename, max_chars in configs_to_check:
             filepath = config_dir / filename
+            if not self._is_file_approved(filepath):
+                continue
             if filepath.exists():
                 try:
                     summary[filename] = filepath.read_text()[:max_chars]
@@ -482,7 +662,10 @@ class CodoorVoIP:
         try:
             log_file = Path(self.paths["logs"]) / "full"
             if log_file.exists():
-                return self.run_command(f"tail -n {lines} {log_file}")
+                command = f"tail -n {lines} {log_file}"
+                if command not in self.approved_commands and not self._is_command_approved(command):
+                    return "Not approved"
+                return self.run_command(command)
             return f"Log file not found: {log_file}"
         except Exception as exc:
             return f"Error reading logs: {str(exc)}"
@@ -499,14 +682,13 @@ class CodoorVoIP:
             context.append(agents_memory)
         context.append("=== PLATFORM ===")
         context.append(f"OS: {status['os'].get('release', 'Unknown')}")
-        context.append(f"FreePBX: {status['freepbx'].get('version', 'Unknown')}")
         context.append(f"Channel drivers: {status['telephony'].get('channel_drivers', 'Unknown')}")
-        context.append(f"Outbound routes: {status['telephony'].get('outbound_routes', 'Unknown')}")
-        context.append(f"Trunks: {status['telephony'].get('trunks', 'Unknown')}")
+        context.append(f"Dialplan contexts: {status['telephony'].get('dialplan_contexts', 'Unknown')}")
+        context.append(f"Endpoints: {status['telephony'].get('endpoints', 'Unknown')}")
         context.append("=== SYSTEM STATUS ===")
         context.append(f"Asterisk: {status['asterisk'].get('version', 'Unknown')}")
         context.append(f"Uptime: {status['asterisk'].get('uptime', 'Unknown')}")
-        context.append(f"SIP Registrations:\n{status['asterisk'].get('sip_registrations', 'None')}")
+        context.append(f"Registrations:\n{status['asterisk'].get('registrations', 'None')}")
         context.append(f"Active Calls: {status['asterisk'].get('active_channels', 'None')}")
 
         context.append("\n=== NETWORK ===")
@@ -534,9 +716,9 @@ class CodoorVoIP:
             context = self.build_system_context()
 
         system_prompt = (
-            "You are Codoor-VoIP, an expert FreePBX/Asterisk/VoIP system administrator.\n\n"
+            "You are Codoor-VoIP, an expert Asterisk/VoIP system administrator.\n\n"
             "YOUR CAPABILITIES:\n"
-            "1. Diagnose FreePBX/Asterisk issues\n"
+            "1. Diagnose Asterisk issues\n"
             "2. Provide configuration fixes\n"
             "3. Suggest CLI commands\n"
             "4. Explain VoIP concepts\n"
@@ -549,7 +731,7 @@ class CodoorVoIP:
             "  ```asterisk\n"
             "  configuration lines\n"
             "  ```\n"
-            "- Prefer *_custom.conf files for FreePBX/Asterisk changes.\n"
+            "- Prefer /etc/asterisk/*.conf files; avoid auto-generated files when possible.\n"
         )
 
         messages = [
@@ -666,6 +848,13 @@ class CodoorVoIP:
             if not self._is_allowed_path(file_path):
                 print(f"Skipping (not allowed): {file_path}")
                 continue
+            if not self._is_file_approved(file_path):
+                answer = input(f"Allow file write for {file_path}? [Y/n]: ").strip().lower()
+                if answer in ("", "y", "yes"):
+                    self._record_file_approval(file_path)
+                else:
+                    print(f"Skipping (not approved): {file_path}")
+                    continue
 
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -681,6 +870,24 @@ class CodoorVoIP:
     # ==================== CLI FLOW ====================
 
     def run_single(self, user_prompt: str) -> None:
+        requirements = self._suggest_requirements(user_prompt)
+        if requirements["files"] or requirements["commands"]:
+            print("\nBefore I do anything, I need approval for:")
+            if requirements["files"]:
+                print("Files:")
+                for file_path in requirements["files"]:
+                    print(f"  - {file_path}")
+            if requirements["commands"]:
+                print("Commands:")
+                for command in requirements["commands"]:
+                    print(f"  - {command}")
+
+            self.approved_files = self._ensure_file_approvals(requirements["files"])
+            self.approved_commands = self._ensure_command_approvals(requirements["commands"])
+
+        if self.approved_files or self.approved_commands:
+            self._update_environment_settings()
+
         response = self.ask_ai(user_prompt)
         commands = self.parse_commands(response)
         changes = self.parse_changes(response)
@@ -693,20 +900,24 @@ class CodoorVoIP:
         if commands:
             print("\nProposed commands:")
             for cmd in commands:
-                answer = input(f"Run '{cmd}'? [y/N]: ").strip().lower()
-                if answer in ["y", "yes"]:
-                    try:
-                        output = self.run_command(cmd)
-                        print(output)
-                        self.last_command_outputs.append(f"$ {cmd}\n{output}")
-                        self.last_commands_run.append(cmd)
-                        ran_command = True
-                    except Exception as exc:
-                        error_text = f"Command failed: {exc}"
-                        print(error_text)
-                        self.last_command_outputs.append(f"$ {cmd}\n{error_text}")
-                        self.last_commands_run.append(cmd)
-                        ran_command = True
+                if not self._is_command_approved(cmd):
+                    answer = input(f"Run '{cmd}'? [y/N]: ").strip().lower()
+                    if answer in ["y", "yes"]:
+                        self._record_command_approval(cmd)
+                    else:
+                        continue
+                try:
+                    output = self.run_command(cmd)
+                    print(output)
+                    self.last_command_outputs.append(f"$ {cmd}\n{output}")
+                    self.last_commands_run.append(cmd)
+                    ran_command = True
+                except Exception as exc:
+                    error_text = f"Command failed: {exc}"
+                    print(error_text)
+                    self.last_command_outputs.append(f"$ {cmd}\n{error_text}")
+                    self.last_commands_run.append(cmd)
+                    ran_command = True
 
         if changes:
             print("\nProposed file changes:")
@@ -742,18 +953,22 @@ class CodoorVoIP:
             if followup_commands:
                 print("\nFollow-up commands:")
                 for cmd in followup_commands:
-                    answer = input(f"Run '{cmd}'? [y/N]: ").strip().lower()
-                    if answer in ["y", "yes"]:
-                        try:
-                            output = self.run_command(cmd)
-                            print(output)
-                            self.last_command_outputs.append(f"$ {cmd}\n{output}")
-                            self.last_commands_run.append(cmd)
-                        except Exception as exc:
-                            error_text = f"Command failed: {exc}"
-                            print(error_text)
-                            self.last_command_outputs.append(f"$ {cmd}\n{error_text}")
-                            self.last_commands_run.append(cmd)
+                    if not self._is_command_approved(cmd):
+                        answer = input(f"Run '{cmd}'? [y/N]: ").strip().lower()
+                        if answer in ["y", "yes"]:
+                            self._record_command_approval(cmd)
+                        else:
+                            continue
+                    try:
+                        output = self.run_command(cmd)
+                        print(output)
+                        self.last_command_outputs.append(f"$ {cmd}\n{output}")
+                        self.last_commands_run.append(cmd)
+                    except Exception as exc:
+                        error_text = f"Command failed: {exc}"
+                        print(error_text)
+                        self.last_command_outputs.append(f"$ {cmd}\n{error_text}")
+                        self.last_commands_run.append(cmd)
 
             if followup_changes:
                 print("\nFollow-up file changes:")
@@ -789,7 +1004,7 @@ class CodoorVoIP:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Codoor-VoIP FreePBX assistant")
+    parser = argparse.ArgumentParser(description="Codoor-VoIP Asterisk assistant")
     parser.add_argument("query", nargs="?", help="Single request to process")
     parser.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
     parser.add_argument("-k", "--api-key", help="DeepSeek API key")
